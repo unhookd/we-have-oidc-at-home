@@ -1,8 +1,12 @@
-# Minimal OIDC + Authorization Code flow + client authentication (single-file, no gems)
+# Minimal OIDC + Authorization Code flow + client authentication + debug SAML IdP
 #
 # STATIC_PASSWORD= REDIRECT_URIS=http://localhost:4180/oauth2/callback OIDC_HOST=localhost OIDC_PORT=9292 bundle exec rackup config.ru -p 9292 -o 0.0.0.0
 #
 # Endpoints:
+#   GET/POST /saml/sso     (SAML login and signed HTTP-POST response)
+#   GET  /saml/metadata   (IdP metadata)
+#   GET/POST /saml/consume (debug inspection, not authentication)
+#   GET/POST/DELETE /crud/saml (debug profile for the current hostname)
 #   GET  /.well-known/openid-configuration
 #   GET  /jwks.json
 #   GET  /authorize        (shows login/consent form)
@@ -22,6 +26,7 @@ require 'base64'
 require 'securerandom'
 require 'time'
 require 'erb'
+require_relative 'saml'
 
 module MinimalOIDC
   class Server
@@ -52,10 +57,13 @@ module MinimalOIDC
 
       # store tokens mapping (access_token => claims)
       @issued_access_tokens = {}
+      @saml = MinimalSAML::Server.new(user: USER, password: STATIC_PASSWORD)
     end
 
     def call(env)
       req = Rack::Request.new(env)
+      return @saml.call(env) if req.path_info.start_with?('/saml/', '/crud/saml')
+
       base = issuer_from_request(req)
 
       case [req.request_method, req.path_info]
