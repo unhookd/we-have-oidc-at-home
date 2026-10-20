@@ -103,6 +103,8 @@ class ServerTest < Minitest::Test
     ENV['SAML_DEBUG'] = 'true'
     assert_equal 401, @request.get(HOST + '/crud/saml').status
     assert_equal 401, debug_request('GET', '/crud/saml', 'HTTP_AUTHORIZATION' => 'Basic !!!').status
+    no_password = 'Basic ' + Base64.strict_encode64('alice')
+    assert_equal 401, debug_request('GET', '/crud/saml', 'HTTP_AUTHORIZATION' => no_password).status
     app = MinimalSAML::Server.new(user: MinimalOIDC::Server::USER, password: '')
     auth = 'Basic ' + Base64.strict_encode64('alice:')
     assert_equal 401, Rack::MockRequest.new(app).get(HOST + '/crud/saml', 'HTTP_AUTHORIZATION' => auth).status
@@ -123,12 +125,12 @@ class ServerTest < Minitest::Test
     assert_equal 'bob@example.test', JSON.parse(updated.body)['name_id']
     assert_equal second, JSON.parse(debug_request('GET', '/crud/saml', host: OTHER).body)
     assert_equal 204, debug_request('POST', '/crud/saml', data: { action: 'delete' }).status
-    assert_equal 400, debug_request('GET', '/crud/saml').status
+    assert_equal 404, debug_request('GET', '/crud/saml').status
     refute_equal first['x509_certificate'], create_profile['x509_certificate']
     assert_equal 204, debug_request('DELETE', '/crud/saml').status
     assert_equal 404, debug_request('DELETE', '/crud/saml').status
     fresh = Rack::MockRequest.new(MinimalOIDC::Server.new)
-    assert_equal 400, fresh.get(HOST + '/saml/metadata').status
+    assert_equal 404, fresh.get(HOST + '/saml/metadata').status
   end
 
   def test_generated_consumer_and_explicit_public_origin
@@ -172,6 +174,11 @@ class ServerTest < Minitest::Test
     assert cert.verify(cert.public_key)
     assert_equal cert.to_der, Base64.strict_decode64(doc.at_xpath('//ds:X509Certificate', namespaces).text)
     assert_equal cert.to_pem, @request.get(HOST + '/saml/certificate').body
+    schema_path = File.join(Gem::Specification.find_by_name('ruby-saml').full_gem_path,
+                            'lib/schemas/saml-schema-metadata-2.0.xsd')
+    File.open(schema_path) do |file|
+      assert_empty Nokogiri::XML::Schema(file).validate(doc)
+    end
   end
 
   def test_redirect_login_produces_a_valid_signed_saml_response
@@ -182,6 +189,12 @@ class ServerTest < Minitest::Test
     assert_equal ACS, doc.root['Destination']
     assert_equal SP, doc.at_xpath('//saml:Audience', NS).text
     assert_equal 2, doc.xpath('//ds:Signature', NS).size
+    conditions = doc.at_xpath('//saml:Conditions', NS)
+    assert_operator Time.iso8601(conditions['NotBefore']), :<=, Time.now
+    assert_in_delta 300, Time.iso8601(conditions['NotOnOrAfter']) - Time.now, 2
+    confirmation = doc.at_xpath('//saml:SubjectConfirmationData', NS)
+    assert_equal ACS, confirmation['Recipient']
+    assert_equal '_request_123', confirmation['InResponseTo']
     assert doc.xpath('//ds:SignatureMethod', NS).all? { |node| node['Algorithm'] == XMLSecurity::Document::RSA_SHA256 }
     result = OneLogin::RubySaml::Response.new(encoded, settings: settings(config), matches_request_id: '_request_123')
     assert result.is_valid?, result.errors.join(', ')
@@ -236,6 +249,53 @@ class ServerTest < Minitest::Test
     form = login_form
     debug_request('POST', '/crud/saml', data: { acs_url: 'https://new.example.test/acs' })
     assert_equal 400, login(form).status
+  end
+
+  def test_expired_login_form_is_rejected
+    create_profile
+    form = login_form
+    Time.stub(:now, Time.now + MinimalSAML::Server::TTL + 1) do
+      assert_equal 400, login(form).status
+    end
+  end
+
+  def test_concurrent_profiles_and_server_instances_do_not_share_signing_keys
+    configs = [create_profile, create_profile(host: OTHER)]
+    MinimalOIDC::Server.new
+    pages = [HOST, OTHER].map do |host|
+      Thread.new { login(login_form(xml: nil, host: host), host: host) }
+    end.map(&:value)
+    pages.each_with_index do |page, index|
+      encoded, doc, = saml_response(page)
+      result = OneLogin::RubySaml::Response.new(encoded, settings: settings(configs[index]))
+      assert result.is_valid?, result.errors.join(', ')
+      verify_xml_signatures(doc, OpenSSL::X509::Certificate.new(configs[index]['x509_certificate']))
+      wrong = settings(configs[index])
+      wrong.idp_cert = configs[1 - index]['x509_certificate']
+      refute OneLogin::RubySaml::Response.new(encoded, settings: wrong).is_valid?
+    end
+  end
+
+  def test_requested_context_must_match_password_authentication
+    create_profile
+    context = <<~XML
+      <samlp:RequestedAuthnContext Comparison="minimum">
+        <saml:AuthnContextClassRef>#{MinimalSAML::Server::AUTHN_CONTEXT}</saml:AuthnContextClassRef>
+      </samlp:RequestedAuthnContext>
+    XML
+    xml = request_xml.sub('</samlp:AuthnRequest>', context + '</samlp:AuthnRequest>')
+    assert_equal 200, login_form(xml: xml).status
+    assert_equal 400, login_form(xml: xml.sub('PasswordProtectedTransport', 'SmartcardPKI')).status
+    assert_equal 400, login_form(xml: xml.sub('minimum', 'better')).status
+  end
+
+  def test_saml_responses_follow_rack_contract
+    create_profile
+    request = Rack::MockRequest.new(Rack::Lint.new(@app))
+    %w[/saml/metadata /saml/certificate /saml/sso /saml/consume /crud/saml].each do |path|
+      assert_equal 200, request.get(HOST + path, 'HTTP_AUTHORIZATION' => @auth).status
+    end
+    assert_equal 204, request.delete(HOST + '/crud/saml', 'HTTP_AUTHORIZATION' => @auth).status
   end
 
   def test_rejects_untrusted_authn_request_routing

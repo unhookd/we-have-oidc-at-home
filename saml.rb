@@ -23,6 +23,7 @@ module MinimalSAML
     TTL = 300
     NS = { 'samlp' => PROTOCOL, 'saml' => ASSERTION }
     class InvalidRequest < StandardError; end
+    class ProfileNotFound < StandardError; end
 
     def initialize(user:, password:)
       @user, @password = user, password
@@ -58,6 +59,8 @@ module MinimalSAML
       else
         reply(404, 'Not Found')
       end
+    rescue ProfileNotFound => e
+      json({ error: e.message }, 404)
     rescue InvalidRequest, JSON::ParserError, Rack::QueryParser::ParameterTypeError,
            Rack::QueryParser::InvalidParameterError, Rack::QueryParser::ParamsTooDeepError => e
       json({ error: e.message }, 400)
@@ -143,7 +146,7 @@ module MinimalSAML
     end
 
     def find_profile(host)
-      @mutex.synchronize { @profiles[host] } || raise(InvalidRequest, 'No SAML profile for this hostname; POST /crud/saml first')
+      @mutex.synchronize { @profiles[host] } || raise(ProfileNotFound, 'No SAML profile for this hostname; POST /crud/saml first')
     end
 
     def configure(req, host)
@@ -288,8 +291,16 @@ module MinimalSAML
         raise InvalidRequest, "Unexpected #{field}" if root[field] && root[field] != value
       end
       if root['AssertionConsumerServiceIndex'] || ['true', '1'].include?(root['IsPassive']) ||
-         root.at_xpath('./samlp:RequestedAuthnContext | ./samlp:Scoping', NS)
-        raise InvalidRequest, 'Indexed ACS, passive login, requested authentication contexts and scoping are not supported'
+         root.at_xpath('./samlp:Scoping', NS)
+        raise InvalidRequest, 'Indexed ACS, passive login and scoping are not supported'
+      end
+      context = root.at_xpath('./samlp:RequestedAuthnContext', NS)
+      if context
+        refs = context.xpath('./saml:AuthnContextClassRef', NS).map(&:text)
+        unless ['exact', 'minimum'].include?(context['Comparison'] || 'exact') &&
+               refs.include?(authn_context(profile)) && !context.at_xpath('./saml:AuthnContextDeclRef', NS)
+          raise InvalidRequest, 'Requested authentication context cannot be satisfied'
+        end
       end
       format = root.at_xpath('./samlp:NameIDPolicy', NS)&.[]('Format')
       if format && ![NAME_ID_FORMAT, 'urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified'].include?(format)
@@ -383,8 +394,7 @@ module MinimalSAML
             xml['saml'].AudienceRestriction { xml['saml'].Audience profile[:sp_entity_id] }
           end
           xml['saml'].AuthnStatement('AuthnInstant' => now.iso8601, 'SessionIndex' => "_#{SecureRandom.hex(20)}") do
-            context = profile[:base].start_with?('https:') ? AUTHN_CONTEXT : 'urn:oasis:names:tc:SAML:2.0:ac:classes:Password'
-            xml['saml'].AuthnContext { xml['saml'].AuthnContextClassRef context }
+            xml['saml'].AuthnContext { xml['saml'].AuthnContextClassRef authn_context(profile) }
           end
           unless profile[:attributes].empty?
             xml['saml'].AttributeStatement do
@@ -409,6 +419,10 @@ module MinimalSAML
         end
       end
       sign(response.doc.root.to_xml(save_with: 0), profile)
+    end
+
+    def authn_context(profile)
+      profile[:base].start_with?('https:') ? AUTHN_CONTEXT : 'urn:oasis:names:tc:SAML:2.0:ac:classes:Password'
     end
 
     def consume(profile, params)

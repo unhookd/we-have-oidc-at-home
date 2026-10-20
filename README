@@ -2,6 +2,125 @@
 
 This is not safe at any speed
 
+## SAML 2.0 debug Identity Provider
+
+The same Rack application serves OIDC and SAML. SAML is for isolated SSO
+development, not production authentication. Configuration, private keys, and
+pending logins live only in memory. Use one process/replica: restarting loses all
+profiles and rotates their certificates. Reconfigure the SP after recreation.
+
+Start with a nonempty password (also used by the existing OIDC login):
+
+```sh
+bundle install
+export STATIC_PASSWORD="$(ruby -rsecurerandom -e 'print SecureRandom.hex(24)')"
+export REDIRECT_URIS=http://localhost:4180/oauth2/callback
+export SAML_DEBUG=true
+bundle exec rackup config.ru -p 9292 -o 127.0.0.1
+```
+
+Configure one profile per full hostname/subdomain. Route those hostnames to this
+deployment; for local testing, map `one.localhost` and `two.localhost` to
+127.0.0.1 if your resolver does not already do so. Ports do not select profiles.
+The current request hostname selects the profile; there is no cross-host listing
+or mutation. Repeat these requests on another subdomain for another linkage.
+
+```sh
+curl -u "alice:$STATIC_PASSWORD" \
+  -H 'Content-Type: application/json' \
+  -d '{"sp_entity_id":"urn:example:application","acs_url":"https://app.example.test/saml/acs"}' \
+  http://one.localhost:9292/crud/saml
+
+# View/export the profile, including all public IdP connection settings.
+curl -u "alice:$STATIC_PASSWORD" \
+  http://one.localhost:9292/crud/saml
+
+# Update selected fields without rotating the signing certificate.
+curl -u "alice:$STATIC_PASSWORD" \
+  -H 'Content-Type: application/json' \
+  -d '{"name_id":"alice@example.test","attributes":{"email":"alice@example.test","groups":["users","admins"]}}' \
+  http://one.localhost:9292/crud/saml
+
+# Delete using POST (DELETE /crud/saml is also supported).
+curl -u "alice:$STATIC_PASSWORD" \
+  -H 'Content-Type: application/json' -d '{"action":"delete"}' \
+  http://one.localhost:9292/crud/saml
+```
+
+POST accepts JSON or URL-encoded forms. Creation returns 201; partial updates
+return 200; deletion returns 204. Supported configuration fields:
+
+- `sp_entity_id`: required on creation; the application's exact SP entity ID.
+- `acs_url`: the application's HTTP(S) Assertion Consumer Service URL.
+  Defaults to the generated `<IdP origin>/saml/consume` for local inspection.
+- `idp_base_url`: optional public origin, for example
+  `https://one.idp.example.test`; its hostname must match the current profile.
+  Defaults to the request origin, including its scheme and nonstandard port.
+- `name_id`: emitted emailAddress NameID; defaults to `alice@example.com`.
+- `attributes`: a map of names to strings or arrays of strings, replacing the
+  default mock user's attributes. This changes asserted identity, not the login
+  credentials: sign in with `alice` and `STATIC_PASSWORD`.
+
+GET exports the Identity Provider SSO URL (`idp_sso_url`), Entity ID / Issuer URL
+(`idp_entity_id`), and PEM X.509 certificate (`x509_certificate`). Copy these
+into your application's SAML IdP configuration, or import `/saml/metadata`.
+Exports never include private keys or passwords. They include generated,
+read-only fields, so use only the supported fields above when posting updates.
+
+Endpoints on each configured hostname:
+
+| Endpoint | Purpose |
+| --- | --- |
+| GET/POST `/crud/saml` | View/export, create, update, or POST-delete this host's profile |
+| DELETE `/crud/saml` | Delete this host's profile |
+| GET `/saml/metadata` | Public SAML 2.0 IdP metadata, SSO bindings, and signing certificate |
+| GET `/saml/certificate` | Public PEM signing certificate |
+| GET/POST `/saml/sso` | SP-initiated SSO with Redirect/POST AuthnRequests; GET without a request starts IdP-initiated SSO |
+| GET/POST `/saml/consume` | Debug settings and decoded, **unverified** SAMLResponse/RelayState inspection |
+
+`/crud/saml` and `/saml/consume` are available only when `SAML_DEBUG=true` and
+require HTTP Basic authentication with `alice` / `STATIC_PASSWORD`. With debug
+disabled they return 404. Do not expose this service to untrusted networks.
+Use HTTPS outside local testing, and configure a trusted reverse proxy to strip
+untrusted forwarded headers and preserve the intended hostname. SAML origins
+are independent of `OIDC_HOST` / `OIDC_PORT` so subdomains remain distinct.
+
+An ACS belongs to the **service provider**, not the IdP. Our GET consumer URL
+shows debug configuration; GET or POST with a Base64 `SAMLResponse` inspects
+XML. It never validates signatures, establishes a session, or treats submitted
+claims as authenticated. Applications must use their own ACS to validate and
+consume responses; outgoing responses always use HTTP-POST, not GET.
+
+The login page exposes the decoded AuthnRequest. After login, inspect the signed
+response and click **Continue to service provider** to submit it to the configured
+ACS with the original RelayState. Both the Response and Assertion are signed
+with RSA-SHA256 using that profile's ephemeral certificate. Assertions include
+audience, recipient, request correlation, attributes, and a five-minute lifetime.
+Login form tokens are single-use, expire after five minutes, and are invalidated
+by profile changes. Certificates remain stable on updates; delete/recreate to
+rotate them.
+
+Limitations: this is a small SAML 2.0 browser-SSO subset, not a general federation
+server. It accepts unsigned AuthnRequests; request signatures, when present,
+are **not verified**. Requests are untrusted routing hints: issuer, destination,
+and requested ACS must match the configured profile, and a password is always
+required before issuance. There is no assertion encryption, Single Logout,
+artifact binding, passive login, indexed ACS selection, or delegated scoping.
+Only emailAddress NameIDs are emitted. Input XML is bounded to 64 KiB (including
+after Redirect inflation), request bodies/queries to 128 KiB, and RelayState to
+2 KiB. DTDs and external entity expansion are not allowed. There are at most 100
+profiles and 1,000 pending login forms per process.
+
+Requested authentication contexts must include the context this IdP actually
+provides (`PasswordProtectedTransport` over HTTPS, otherwise `Password`), with
+`exact` or `minimum` comparison. Stronger or unsupported contexts are rejected.
+
+Run the regression suite (SAML signatures/flows, debug controls, and OIDC):
+
+```sh
+bundle exec ruby test/server_test.rb
+```
+
 ## oauth2-proxy k8s container/service
 
 ```
